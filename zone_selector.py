@@ -46,13 +46,21 @@ class ZoneSelector:
 
         print("Click to add points. Press 'c' to clear. Press 'Enter' or 'Space' to save and exit.")
 
-        while True:
-            key = cv2.waitKey(1) & 0xFF
-            if key in [13, 32]: # Enter or Space
-                break
-            elif key == ord('c'):
-                self.points = []
-                cv2.imshow(self.window_name, self.frame)
+        try:
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key in [13, 32]: # Enter or Space
+                    break
+                elif key == ord('c'):
+                    self.points = []
+                    cv2.imshow(self.window_name, self.frame)
+                
+                # Если пользователь нажал крестик (закрыл окно)
+                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+        except KeyboardInterrupt:
+            # Перехватываем Ctrl+C в терминале
+            pass
 
         cv2.destroyAllWindows()
         self.save_zone()
