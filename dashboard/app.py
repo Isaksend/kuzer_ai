@@ -2,17 +2,19 @@ import sys
 import json
 import csv
 import cv2
+import os
 import time
 import asyncio
+import shutil
 import threading
 import numpy as np
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-# Добавляем корень проекта в path, чтобы импортировать config / logger / telegram
+# Добавляем корень проекта
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -20,49 +22,120 @@ from config import (
     VIDEO_SOURCE, ZONES_FILE, INCIDENTS_DIR, LOG_FILE,
     MODEL_PATH, CONFIDENCE_THRESHOLD, ZONE_COLORS,
     DELAY_SECONDS, DASHBOARD_HOST, DASHBOARD_PORT,
+    UPLOADS_DIR, RING_BUFFER_SECONDS, POST_RECORD_SECONDS,
+    source_key,
 )
 
 app = FastAPI(title="Zone Monitor Dashboard")
 
-# ── Static files (для скриншотов инцидентов) ────────────────────
+# ── Static files ────────────────────────────────────────────────
 Path(INCIDENTS_DIR).mkdir(exist_ok=True)
+Path(UPLOADS_DIR).mkdir(exist_ok=True)
+recordings_dir = os.path.join(INCIDENTS_DIR, "recordings")
+Path(recordings_dir).mkdir(exist_ok=True)
+
 app.mount("/incidents", StaticFiles(directory=INCIDENTS_DIR), name="incidents")
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 # ── Shared state ────────────────────────────────────────────────
-latest_frame_bytes = None  # JPEG bytes текущего кадра
+latest_frame_bytes = None
 frame_lock = threading.Lock()
+current_source = VIDEO_SOURCE
+worker_thread = None
+worker_stop = threading.Event()
+zones_changed = threading.Event()  # Сигнал воркеру перезагрузить зоны
+
+
+# ── Per-video zone storage ──────────────────────────────────────
+def _load_all_zones():
+    """Читает весь файл зон (поддержка нового и старого формата)."""
+    try:
+        with open(ZONES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    # Старый формат {"zones": [...]} — мигрируем в per-video
+    if "zones" in data and isinstance(data["zones"], list):
+        key = source_key(VIDEO_SOURCE)
+        migrated = {key: {"zones": data["zones"]}}
+        _save_all_zones(migrated)
+        return migrated
+
+    return data
+
+
+def _save_all_zones(all_data):
+    with open(ZONES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, indent=4, ensure_ascii=False)
+
+
+def _load_zones_for(src):
+    """Загружает зоны для конкретного источника → list of dicts с polygon."""
+    key = source_key(src)
+    all_data = _load_all_zones()
+    entry = all_data.get(key, {})
+    zone_list = entry.get("zones", [])
+
+    return [
+        {
+            "name": z.get("name", f"Zone_{i+1}"),
+            "polygon": np.array(z["points"], np.int32),
+            "color": ZONE_COLORS[i % len(ZONE_COLORS)],
+        }
+        for i, z in enumerate(zone_list)
+    ]
+
+
+def _save_zones_for(src, zones_data):
+    """Сохраняет зоны для конкретного источника."""
+    key = source_key(src)
+    all_data = _load_all_zones()
+    all_data[key] = zones_data
+    _save_all_zones(all_data)
 
 
 # ── Background video processing ────────────────────────────────
-def video_worker():
-    """Фоновый поток: YOLO + трекинг + отрисовка зон → encode в JPEG."""
+def video_worker(source):
     global latest_frame_bytes
     from ultralytics import YOLO
     from logger import IncidentLogger
     from telegram_notifier import TelegramNotifier
+    from video_stream import VideoStream
+    from video_recorder import VideoRecorder
+
+    try:
+        stream = VideoStream(source, buffer_seconds=RING_BUFFER_SECONDS)
+    except RuntimeError as e:
+        print(f"[Dashboard] {e}")
+        return
 
     model = YOLO(MODEL_PATH)
-    logger_instance = IncidentLogger()
+    logger_inst = IncidentLogger()
     telegram = TelegramNotifier()
+    recorder = VideoRecorder(fps=stream.fps, post_seconds=POST_RECORD_SECONDS)
 
-    zones = _load_zones()
+    zones = _load_zones_for(source)
     alarm_timers = {}
     zone_durations = {}
 
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        print(f"[Dashboard] Cannot open video: {VIDEO_SOURCE}")
-        return
+    print(f"[Dashboard] Worker started. Source={source_key(source)}, FPS={stream.fps:.0f}, zones={len(zones)}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    delay = 1.0 / fps
+    while not worker_stop.is_set():
+        # Hot-reload зон без перезапуска
+        if zones_changed.is_set():
+            zones_changed.clear()
+            zones = _load_zones_for(source)
+            print(f"[Dashboard] Zones hot-reloaded: {len(zones)} zone(s)")
 
-    print(f"[Dashboard] Video worker started. FPS={fps:.0f}, zones={len(zones)}")
+        if stream.is_done:
+            # Видео файл закончился — не читаем дальше (кадры будут повторяться последние)
+            time.sleep(1.0)
+            continue
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame = stream.read()
+        if frame is None:
+            time.sleep(0.01)
             continue
 
         current_time = time.time()
@@ -82,9 +155,9 @@ def video_worker():
                 triggered = [z for z in zones if cv2.pointPolygonTest(z["polygon"], foot, False) >= 0]
 
                 if triggered:
+                    was_new = obj_id not in alarm_timers
                     alarm_timers[obj_id] = current_time
 
-                    # Время в зоне
                     if obj_id not in zone_durations:
                         zone_durations[obj_id] = {"enter": current_time, "total": 0.0}
                     elif zone_durations[obj_id]["enter"] is None:
@@ -101,8 +174,12 @@ def video_worker():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
                     for z in triggered:
-                        logger_instance.log_incident(frame, obj_id, z["name"], current_time)
+                        logger_inst.log_incident(frame, obj_id, z["name"], current_time)
                         telegram.notify(frame, obj_id, z["name"], current_time)
+
+                    if was_new:
+                        ring = stream.get_ring_buffer()
+                        recorder.record(ring, stream, key=f"{int(obj_id)}")
                 else:
                     if obj_id in zone_durations and zone_durations[obj_id]["enter"] is not None:
                         zone_durations[obj_id]["total"] += current_time - zone_durations[obj_id]["enter"]
@@ -122,7 +199,7 @@ def video_worker():
         for oid in expired:
             del alarm_timers[oid]
 
-        # Рисуем зоны
+        # Зоны
         overlay = frame.copy()
         for zone in zones:
             pts = zone["polygon"].reshape((-1, 1, 2))
@@ -133,6 +210,10 @@ def video_worker():
             cy = int(np.mean(zone["polygon"][:, 1]))
             cv2.putText(frame, zone["name"], (cx - 30, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+
+        # FPS
+        cv2.putText(frame, f"FPS: {stream.measured_fps:.0f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # ALARM
         if alarm_timers:
@@ -147,30 +228,23 @@ def video_worker():
         with frame_lock:
             latest_frame_bytes = buf.tobytes()
 
-        time.sleep(delay)
+    stream.stop()
+    print("[Dashboard] Worker stopped.")
 
-    cap.release()
+
+def start_worker(source):
+    global worker_thread, current_source
+    worker_stop.clear()
+    zones_changed.clear()
+    current_source = source
+    worker_thread = threading.Thread(target=video_worker, args=(source,), daemon=True)
+    worker_thread.start()
 
 
-def _load_zones():
-    try:
-        with open(ZONES_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return []
-
-    if "zones" in data:
-        return [
-            {
-                "name": z.get("name", f"Zone_{i+1}"),
-                "polygon": np.array(z["points"], np.int32),
-                "color": ZONE_COLORS[i % len(ZONE_COLORS)],
-            }
-            for i, z in enumerate(data["zones"])
-        ]
-    if "zone" in data:
-        return [{"name": "Zone_1", "polygon": np.array(data["zone"], np.int32), "color": ZONE_COLORS[0]}]
-    return []
+def stop_worker():
+    worker_stop.set()
+    if worker_thread:
+        worker_thread.join(timeout=5)
 
 
 # ── REST API ────────────────────────────────────────────────────
@@ -180,12 +254,18 @@ async def index():
     return html_path.read_text(encoding="utf-8")
 
 
+@app.get("/api/source")
+async def get_source():
+    """Текущий источник видео."""
+    return JSONResponse({"source": current_source, "key": source_key(current_source)})
+
+
 @app.get("/api/incidents")
 async def get_incidents():
     if not Path(LOG_FILE).exists():
         return JSONResponse([])
     rows = []
-    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)
@@ -193,23 +273,80 @@ async def get_incidents():
 
 
 @app.get("/api/zones")
-async def get_zones():
-    if not Path(ZONES_FILE).exists():
-        return JSONResponse({"zones": []})
-    with open(ZONES_FILE, 'r', encoding='utf-8') as f:
-        return JSONResponse(json.load(f))
+async def get_zones(source: str = ""):
+    """Возвращает зоны для указанного источника (или текущего)."""
+    src = source or current_source
+    key = source_key(src)
+    all_data = _load_all_zones()
+    entry = all_data.get(key, {"zones": []})
+    return JSONResponse({"zones": entry.get("zones", []), "source_key": key})
 
 
 @app.post("/api/zones")
 async def save_zones_api(request_body: dict):
-    with open(ZONES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(request_body, f, indent=4, ensure_ascii=False)
-    return JSONResponse({"status": "ok", "count": len(request_body.get("zones", []))})
+    """Сохраняет зоны для указанного источника и триггерит hot-reload."""
+    src = request_body.get("source", "") or current_source
+    zones_data = {"zones": request_body.get("zones", [])}
+    _save_zones_for(src, zones_data)
+    zones_changed.set()  # Сигнал воркеру обновить зоны
+    return JSONResponse({
+        "status": "ok",
+        "count": len(zones_data["zones"]),
+        "source_key": source_key(src),
+    })
+
+
+# ── Video Upload ────────────────────────────────────────────────
+@app.post("/api/upload-video")
+async def upload_video(file: UploadFile = File(...)):
+    filename = file.filename or "uploaded.mp4"
+    filepath = os.path.join(UPLOADS_DIR, filename)
+    with open(filepath, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return JSONResponse({"status": "ok", "path": filepath, "filename": filename})
+
+
+@app.post("/api/switch-source")
+async def switch_source(body: dict):
+    """Переключает источник видео. Зоны автоматически загружаются для нового источника."""
+    source = body.get("source", "")
+    if not source:
+        return JSONResponse({"error": "source is required"}, status_code=400)
+
+    if source == "__default__":
+        source = VIDEO_SOURCE
+    elif not source.startswith(("rtsp://", "http://", "/", "C:", "D:", "c:", "d:")):
+        source = os.path.join(UPLOADS_DIR, source)
+
+    stop_worker()
+    start_worker(source)
+    return JSONResponse({
+        "status": "ok",
+        "source": source,
+        "source_key": source_key(source),
+    })
+
+
+# ── Analytics API ───────────────────────────────────────────────
+@app.get("/api/analytics")
+async def get_analytics():
+    from analytics import Analytics
+    return JSONResponse(Analytics.generate_report())
+
+
+# ── Recordings list ─────────────────────────────────────────────
+@app.get("/api/recordings")
+async def get_recordings():
+    recs_dir = os.path.join(INCIDENTS_DIR, "recordings")
+    if not os.path.exists(recs_dir):
+        return JSONResponse([])
+    files = sorted(os.listdir(recs_dir), reverse=True)
+    return JSONResponse([{"filename": f, "url": f"/incidents/recordings/{f}"} for f in files[:20]])
 
 
 # ── WebSocket Video Stream ──────────────────────────────────────
 @app.websocket("/ws/video")
-async def video_stream(websocket: WebSocket):
+async def video_ws(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
@@ -225,8 +362,7 @@ async def video_stream(websocket: WebSocket):
 # ── Startup ─────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    thread = threading.Thread(target=video_worker, daemon=True)
-    thread.start()
+    start_worker(current_source)
 
 
 if __name__ == "__main__":
