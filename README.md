@@ -1,3 +1,7 @@
+# Video demonstration:
+
+https://youtu.be/5PKRlRDz7o8
+
 # Zone Monitor (YOLOv8 + OpenCV + FastAPI)
 
 A restricted zone monitoring system for video streams with RTSP support. Uses YOLOv8 for detection and tracking, OpenCV for visualization, and FastAPI for a web-based real-time dashboard.
